@@ -1,6 +1,7 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { PaymentQueueService } from '../payment-queue/payment-queue.service.js';
 import { PaymentOrderMessage } from '../payment-queue.interface.js';
+import { RabbitmqService } from '../rabbitmq/rabbitmq.service.js';
 
 // PaymentConsumerService will contain all the business logic
 // will validate received messages
@@ -13,7 +14,10 @@ export class PaymentConsumerService implements OnModuleInit{
 
     private readonly logger = new Logger(PaymentConsumerService.name)
 
-    constructor (private readonly paymentQueueService: PaymentQueueService) {}
+    constructor (
+        private readonly paymentQueueService: PaymentQueueService,
+        private readonly rabbitMqService: RabbitmqService
+    ) {}
 
     // turn on the module so it can listen
     async onModuleInit () {
@@ -25,6 +29,12 @@ export class PaymentConsumerService implements OnModuleInit{
         try {
 
             this.logger.log('Starting to consume payment orders from queue')
+            const isConnected = await this.rabbitMqService.waitForConnection();
+
+            if (!isConnected) {
+                this.logger.error (`Could not connect to RabbitMQ after multiple attemps`)
+                return
+            }
 
             // registers the callback to process each message
             // bind(this) ensures that 'this' inside the callback refers to this class
@@ -52,13 +62,15 @@ export class PaymentConsumerService implements OnModuleInit{
 
             if (!this.validateMessage(message)) {
                 this.logger.error('Invalid payment message received')
-                return
+                throw new Error ('Invalid payment message received')
             }
 
             this.logger.log('Payment order received and validated')
 
         } catch (error) {
             this.logger.error(`Failed to process payment for order: ${message.orderId}`, error)
+
+            // re-throws the error for rabbitMQ sends a NACK
             throw error
         }
     }
