@@ -131,7 +131,14 @@ export class RabbitmqService implements OnModuleInit, OnModuleDestroy {
         exchange: string,
         routingKey: string,
         callback: (message: any) => Promise<void>,
+        options: {
+            maxRetries?: number;
+            retryDelayMs?: number;
+        } = {}
     ): Promise<void> {
+        const maxRetries = options.maxRetries ?? 3
+        const retryDelayMs = options.retryDelayMs ?? 30000
+
         try {
 
             if (!this.channel) {
@@ -139,31 +146,47 @@ export class RabbitmqService implements OnModuleInit, OnModuleDestroy {
             }
 
             
-            await this.channel.assertExchange(exchange, 'topic', { durable: true })
-
+            
+            // DLQ
             const dlxExchange = `${exchange}.dlx`
             await this.channel.assertExchange(dlxExchange, 'topic', { durable: true })
-
+            
             const dlqName = `${queueName}.dlq`
             await this.channel.assertQueue(dlqName, {
                 durable: true,
                 arguments: {
                     'x-message-ttl': 604800000, // 7 day for analysis
                 }
-            })
-
-            const routingKeyDlq = `${routingKey}.dead`
-
+            });
+            const routingKeyDlq = `${routingKey}.dlq`
             await this.channel.bindQueue(dlqName, dlxExchange, routingKeyDlq)
-
-
+            
+            // retry
+            const routingKeyRetry =  `${routingKey}.retry`
+            const retryExchange = `${exchange}.retry.dlx`
+            await this.channel.assertExchange(retryExchange, 'topic', { durable: true })  
+            
+            const retryQueueName = `${queueName}.retry`
+            await this.channel.assertQueue(retryQueueName, {
+                durable: true,
+                arguments: {
+                    'x-message-ttl': retryDelayMs,
+                    'x-dead-letter-exchange': exchange,
+                    'x-dead-letter-routing-key': routingKey
+                }
+            });
+            await this.channel.bindQueue(retryQueueName, retryExchange, routingKeyRetry)
+            
+            
+            // main queue
+            await this.channel.assertExchange(exchange, 'topic', { durable: true })
             const queue = await this.channel.assertQueue(queueName, { 
                     durable: true, 
                     arguments: {
                         'x-message-ttl': 86400000,
                         'x-max-length': 10000,
-                        'x-dead-letter-exchange': dlxExchange,
-                        'x-dead-letter-routing-key': routingKeyDlq
+                        'x-dead-letter-exchange': retryExchange,
+                        'x-dead-letter-routing-key': routingKeyRetry
                     }
             })
 
@@ -179,25 +202,63 @@ export class RabbitmqService implements OnModuleInit, OnModuleDestroy {
                     try {
 
                         // rabbitMQ only receives bits, so it parses them into JSON
-                        const message = JSON.parse(msg.content.toString())
-                        this.logger.log(`Message received from queue: ${queueName}`)
-                        this.logger.debug(`Message content: ${JSON.stringify(message)}`)
-                        await callback(message)
+                        const message = JSON.parse(msg.content.toString());
+                        this.logger.log(`Message received from queue: ${queueName}`);
+                        this.logger.debug(`Message content: ${JSON.stringify(message)}`);
+
+                        const retryCount = this.getRetryCount(msg);
+                        this.logger.log(`Message received (attempt ${retryCount + 1}/${maxRetries + 1})`)
+
+                        await callback(message);
 
                         this.channel.ack(msg)
                         this.logger.log(`Message processed successfully from queue: ${queueName}`)
 
                     } catch (error) {
-                        this.logger.error(`Error processing message: `, error)
-                        this.channel.nack(msg, false, false)
-                        this.logger.warn(`Message sent to DLQ: ${dlqName}`)
+                        // retry is only called when an error occurs
+                        const retryCount = this.getRetryCount(msg)
+
+                        if (retryCount < maxRetries) {
+                            this.logger.warn(`Process failed (attempt ${retryCount + 1}/${maxRetries + 1})` +
+                                `Retrying in ${retryDelayMs / 1000}s...`
+                            )    
+                            this.channel.nack(msg, false, false)
+                        } else {
+                            this.logger.error(`Max retries (${maxRetries}) excceded. Sending to DLQ`);
+
+                            // publish directly to DLQ 
+                            this.channel.publish(
+                                dlxExchange, 
+                                routingKeyDlq, 
+                                msg.content, {persistent: true, headers: msg.properties.headers})
+                            this.channel.ack(msg)
+                        }
                     }
                 }
-            })
+            });
+
+            this.logger.log(`Subscribed to queue: ${queueName}`)
+            this.logger.log(`Retry queue: ${retryQueueName} (${retryDelayMs}ms delay)`)
+            this.logger.log(`Dead letter queue: ${dlqName}`)
 
         } catch (error) {
             this.logger.error(`Error subscribing to queue  ${queueName}:`, error)
         }
+    }
+
+    private getRetryCount (msg: amqp.ConsumeMessage): number {
+        const xDeath = msg.properties.headers?.['x-death'] as 
+            | Array<{
+                count: number;
+                queue: string;
+            }> 
+            | undefined
+        if (!xDeath || xDeath.length === 0) {
+            return 0
+        }
+
+        return xDeath.filter((death) => !death.queue.endsWith('.retry'))
+        .reduce((sum, death) => sum + (death.count || 0), 0)
     }
 
     getChannel(): amqp.Channel {
