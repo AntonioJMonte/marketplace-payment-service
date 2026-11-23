@@ -9,8 +9,44 @@ import { RabbitmqService } from '../rabbitmq/rabbitmq.service.js';
 // will handle business errors
 // will log payments transactions
 
+
+export interface ConsumerMetrics {
+    totalProcessed: number;
+    totalSuccess: number;
+    totalFailed: number;
+    totalRetries: number;
+    lastProcessedAt: Date | null;
+    startedAt: Date;
+    averageProcessesingTime: number;
+}
+
+
 @Injectable()
 export class PaymentConsumerService implements OnModuleInit{
+
+    /*
+    * ===========================
+    * MONITORING METRICS
+    * ===========================
+    * Stores processing statistics in memory
+    * In production, we would use Prometheus, DataDog, etc.    
+    */
+
+    private metrics: ConsumerMetrics = {
+        totalProcessed: 0,
+        totalSuccess: 0,
+        totalFailed: 0,
+        totalRetries: 0,
+        lastProcessedAt: null,
+        startedAt: new Date(),
+        averageProcessesingTime: 0,
+    }
+
+    /* 
+    * Accumulator to save the average processing time 
+    * We keep the total sum so that we dont need to store  all the individual times 
+    */
+    private totalProcessingTime = 0 
 
     private readonly logger = new Logger(PaymentConsumerService.name)
 
@@ -21,7 +57,8 @@ export class PaymentConsumerService implements OnModuleInit{
 
     // turn on the module so it can listen
     async onModuleInit () {
-        this.logger.log('Starting Payment Consumer Service')
+        this.logger.log('Starting Payment Consumer Service');
+        this.metrics.startedAt = new Date();
         await this.startConsuming();
     }
 
@@ -50,6 +87,7 @@ export class PaymentConsumerService implements OnModuleInit{
     }
 
     private async processPaymentOrder (message: PaymentOrderMessage): Promise <void> {
+        const startTime = Number(new Date())
         try {
             
             this.logger.log(
@@ -66,8 +104,10 @@ export class PaymentConsumerService implements OnModuleInit{
             }
 
             this.logger.log('Payment order received and validated')
+            this.updateMetrics(true, startTime)
 
         } catch (error) {
+            this.updateMetrics(false, startTime)
             this.logger.error(`Failed to process payment for order: ${message.orderId}`, error)
 
             // re-throws the error for rabbitMQ sends a NACK
@@ -112,4 +152,63 @@ export class PaymentConsumerService implements OnModuleInit{
 
     }
 
+
+    private updateMetrics(success: boolean, startTime: number): void {
+        // Calculates the processing time for this message
+        const processingTime = Date.now() - startTime;
+
+        // Increments counters
+        this.metrics.totalProcessed++;
+        this.metrics.lastProcessedAt = new Date();
+
+        if (success) this.metrics.totalSuccess++;
+        else this.metrics.totalFailed++;
+
+        // Update average processing time
+        this.totalProcessingTime += processingTime;
+        this.metrics.averageProcessesingTime = Math.round(
+            this.totalProcessingTime / this.metrics.totalProcessed,
+        )
+
+        if (this.metrics.totalProcessed % 10 === 0) {
+            this.logMetricsSummary();
+        }
+    }
+
+    incrementRetryCount(): void {
+        this.metrics.totalRetries++;
+    }
+
+    private logMetricsSummary(): void {
+        const successRate = this.metrics.totalProcessed > 0 
+        ? ((this.metrics.totalSuccess / this.metrics.totalProcessed) * 100).toFixed(2)
+        : '0';
+
+        this.logger.log('===== CONSUMER METRICS =====')
+        this.logger.log(` Total Processed: ${this.metrics.totalProcessed}`)
+        this.logger.log(` Success: ${this.metrics.totalSuccess}`)
+        this.logger.log(` Failed: ${this.metrics.totalFailed}`)
+        this.logger.log(` Retries: ${this.metrics.totalRetries}`)
+        this.logger.log(` Success Rate: ${successRate}`)
+        this.logger.log(` Avg Processing Time: ${this.metrics.averageProcessesingTime}ms`)
+        this.logger.log('=============================')
+    }
+
+    getMetrics(): ConsumerMetrics {
+        return { ...this.metrics }
+    }
+
+    resetMetrics(): void {
+        this.metrics = {
+            totalProcessed: 0,
+            totalSuccess: 0,
+            totalFailed: 0,
+            totalRetries: 0,
+            lastProcessedAt: null,
+            startedAt: new Date(),
+            averageProcessesingTime: 0,
+        }
+        this.totalProcessingTime = 0;
+        this.logger.log('Metrics reset')
+    }
 }

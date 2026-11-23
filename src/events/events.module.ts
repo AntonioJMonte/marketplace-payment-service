@@ -5,10 +5,11 @@ import { PaymentQueueService } from './payment-queue/payment-queue.service.js';
 import { PaymentConsumerService } from './payment-consumer/payment-consumer.service.js';
 import { DlqService } from './dlq/dlq.service.js';
 import { DlqController } from './dlq/dlq.controller.js';
+import { MetricsController } from './metrics/metrics.controller.js';
 
 @Module({
   imports: [ConfigModule],
   providers: [RabbitmqService, PaymentQueueService, PaymentConsumerService, DlqService],
-  controllers: [DlqController]
+  controllers: [DlqController, MetricsController]
 })
 export class EventsModule {}

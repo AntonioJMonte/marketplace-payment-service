@@ -146,7 +146,6 @@ export class RabbitmqService implements OnModuleInit, OnModuleDestroy {
             }
 
             
-            
             // DLQ
             const dlxExchange = `${exchange}.dlx`
             await this.channel.assertExchange(dlxExchange, 'topic', { durable: true })
